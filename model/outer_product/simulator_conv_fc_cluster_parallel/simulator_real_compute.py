@@ -576,8 +576,8 @@ class OutProductSimulator:
                                     )
                                     or any(not acc.is_empty() for acc in accumulators)
                                 ):
-                                    
-                                    # (A) 任务派发阶段
+
+                                    # 任务派发
                                     for i, core in enumerate(self.cores):
                                         if core.is_finished and cin_queue:
                                             local_cin = cin_queue[0]
@@ -607,11 +607,10 @@ class OutProductSimulator:
                                                     H=current_cin_map.shape[0],
                                                 )
 
-                                    # (A.5) SplitUnit 前端解码阶段
-                                    for cluster in self.clusters:
-                                        for core in cluster:
-                                            if not core.is_finished:
-                                                core.split_unit.tick()
+                                    # (A) accumulator consumes requests from
+                                    # the previous cycle first.
+                                    for accumulator in accumulators:
+                                        accumulator.tick()
 
                                     # (B) 内存总线传输阶段：写回 Psum
                                     for cluster in self.clusters:
@@ -620,25 +619,27 @@ class OutProductSimulator:
                                                 if core.pool is not None:
                                                     core.pool.set_cycle(self.retire_trace_cycle)
                                                 core.pool.try_flush_to_accumulator()
-                                            
+
+                                    # (C) Core consumes packages already in the
+                                    # FIFO at the start of this cycle.
                                     for cluster in self.clusters:
                                         for core in cluster:
                                             core.retire_trace_cycle = self.retire_trace_cycle
 
+                                            if not core.is_finished:
+                                                core.tick_compute()
+
+                                    # (D) SplitUnit produces the next package
+                                    # after Core; it is visible next cycle.
                                     for cluster in self.clusters:
                                         for core in cluster:
                                             if not core.is_finished:
-                                                core.tick_compute()
-                                        
-                                    for accumulator in accumulators:
-                                        accumulator.tick()
+                                                core.split_unit.tick()
                                     self._sample_post_split_phases()
                                     
                                     # === 隐形周期tick监控 ===
                                     for i, core in enumerate(self.cores):
                                         # splitunit在FIFO中所有数据都给pu后，才会finish
-                                        # Post-Split phases are sampled separately by
-                                        # _sample_post_split_phases().
                                         # core算完了，而且发现cin队列为空，那就只需要等待其它core的计算了。
                                         if core.is_finished and not cin_queue:
                                             self.total_tile_idle[i] += 1
@@ -646,9 +647,9 @@ class OutProductSimulator:
                                     time_step_compute_cycles += 1
                                     self.retire_trace_cycle += 1
                                 
-                                compute_with_systolic = time_step_compute_cycles + valid_pu
-                                self.compute_cycles += compute_with_systolic
-                                group_total_cycles += max(compute_with_systolic, load_act_cycle)
+                                compute_with_systolic = time_step_compute_cycles + valid_pu   # 如果PU级联，cycles是这个
+                                self.compute_cycles += time_step_compute_cycles
+                                group_total_cycles += max(time_step_compute_cycles, load_act_cycle)
 
                                 # 每个时间步算完后，bank中的内容读取给LIF层一次，更新膜电位后再写回bank
                                 spike_write_data = valid_oh * valid_ow * wave_cout * self.mp_size
@@ -849,8 +850,6 @@ class OutProductSimulator:
                 )
                 or any(not acc.is_empty() for acc in accumulators)
             ):
-                # DEBUG
-                # print(f'运行至第{time_step_compute_cycles}个周期')  # 代码在正常运行，只是core一直触发不了finish。
                 # 1. 任务派发
                 for i, core in enumerate(self.cores):
                     if core.is_finished and cin_queue:
@@ -888,11 +887,9 @@ class OutProductSimulator:
                                 valid_pus[cluster_idx],
                             )
 
-                # 2. 前端 SplitUnit 推进
-                for cluster in self.clusters:
-                    for core in cluster:
-                        if not core.is_finished:
-                            core.split_unit.tick()
+                # 2. 后端 accumulator 先处理上一拍提交的请求。
+                for accumulator in accumulators:
+                    accumulator.tick()
 
                 # 3. Bank 写回机制
                 for cluster in self.clusters:
@@ -912,9 +909,13 @@ class OutProductSimulator:
                         if not core.is_finished:
                             core.tick_compute_linear()
 
-                # 5. 后端 Bank 运转
-                for accumulator in accumulators:
-                    accumulator.tick()
+                # 5. SplitUnit produces a package after Core; it becomes
+                # visible to Core in the next cycle.
+                for cluster in self.clusters:
+                    for core in cluster:
+                        if not core.is_finished:
+                            core.split_unit.tick()
+
                 self._sample_post_split_phases()
                 time_step_compute_cycles += 1
                 self.retire_trace_cycle += 1
@@ -999,4 +1000,3 @@ class OutProductSimulator:
         # 注意：由于我们在 core.py 中去掉了全量 PU 驱动，导致返回的输出张量全是 0。
         # 既然我们只做周期评估，这里直接返回 None 即可。
         return None, self.global_stats
-

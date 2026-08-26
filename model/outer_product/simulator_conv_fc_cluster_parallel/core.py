@@ -45,6 +45,9 @@ class Core:
 
         self.core_id = -1
         self.pool = None
+        # The issue FIFO stores complete packages.  Keep only the package
+        # currently being processed so it can be retried after a stall.
+        self.current_packet = None
         self.is_finished = True
         self.total_tail_draining_cycles = 0
         self.reset_performance_counters()
@@ -79,8 +82,8 @@ class Core:
     def has_pending_issue(self):
         return (
             getattr(self, 'pending_linear_retire', None) is not None
-            or self.current_row_insts is not None
-            or len(self.split_unit.row_fifo) > 0
+            or self.current_packet is not None
+            or len(self.split_unit.issue_fifo) > 0
         )
 
     def configure_conv_weights(self, cin, kernel):
@@ -134,22 +137,21 @@ class Core:
         self.conv_mode_split_counts.update(self.split_unit.conv_mode_counts)
         for mode in (0, 1, 2):
             self.conv_mode_split_counts.setdefault(mode, 0)
-        self.current_row_insts = None
+        self.current_packet = None
         self.pending_linear_retire = None
-        self.inst_ptr = 0
-        self.bitstream_ptr = 0
 
     def tick_compute(self):
         if self.is_finished:
             return
 
-        if not self._ensure_current_insts():
+        if not self._ensure_current_packet():
             return
 
-        r = int(self.current_row_insts['r'][self.inst_ptr])
-        c = int(self.current_row_insts['c'][self.inst_ptr])
-        mode = int(self.current_row_insts['mode'][self.inst_ptr])
-        mask = self._read_mode_mask(mode)
+        packet = self.current_packet
+        r = int(packet['r'].item())
+        c = int(packet['c'].item())
+        mode = int(packet['mode'].item())
+        mask = self._read_packet_mask(packet, mode)
 
         active_rs = self._active_rows_for_conv(r)
         self.pool.retire_old(active_rs)
@@ -179,7 +181,7 @@ class Core:
                 self._record_pe2_retire_columns(buffers_to_use[r - 2], c, mode, mask)
                 self.pe_cycles[2] += 1
 
-        self._advance_conv_issue_ptr(mode)
+        self.current_packet = None
 
     def init_for_linear_tile(self, accumulator, core_id, if_map, valid_pu):
         self.core_id = core_id
@@ -197,10 +199,8 @@ class Core:
             buf['data'] = torch.zeros(self.psum_w, dtype=torch.float32)
 
         self.split_unit.init_stream(if_map, mode='linear')
-        self.current_row_insts = None
+        self.current_packet = None
         self.pending_linear_retire = None
-        self.inst_ptr = 0
-        self.bitstream_ptr = 0
 
         self.H = 999999
 
@@ -210,18 +210,19 @@ class Core:
 
         if self.pending_linear_retire is not None:
             if self._try_commit_linear_retire():
-                self._advance_linear_issue_ptr()
+                self.current_packet = None
             else:
                 self._record_retire_backpressure_stall()
             return
 
-        if not self._ensure_current_insts():
+        if not self._ensure_current_packet():
             return
 
-        r = int(self.current_row_insts['r'][self.inst_ptr])
-        c = int(self.current_row_insts['c'][self.inst_ptr])
-        mode = int(self.current_row_insts['mode'][self.inst_ptr])
-        mask = self._read_bitstream(3)
+        packet = self.current_packet
+        r = int(packet['r'].item())
+        c = int(packet['c'].item())
+        mode = int(packet['mode'].item())
+        mask = self._read_packet_mask(packet, mode)
 
         target_r0 = r
         target_r1 = r - 1
@@ -259,24 +260,40 @@ class Core:
                 self._record_retire_backpressure_stall()
                 return
 
-        self._advance_linear_issue_ptr()
+        self.current_packet = None
 
-    def _ensure_current_insts(self):
-        if self.current_row_insts is not None:
+    def _ensure_current_packet(self):
+        """Keep a stalled package or fetch one complete package from FIFO.
+
+        The first branch and the FIFO branch are mutually exclusive.  A
+        package that has already been fetched remains in ``current_packet``
+        while the backend waits for a psum buffer or retire capacity.  Only
+        after that package completes do we fetch the next FIFO element.
+        """
+        if self.current_packet is not None:
+            # Retry the same package after a resource stall.  It must not be
+            # removed from the FIFO again or decoded as a second package.
             return True
 
-        if len(self.split_unit.row_fifo) > 0:
-            self.current_row_insts = self.split_unit.row_fifo.popleft()
-            self.inst_ptr = 0
-            self.bitstream_ptr = 0
+        if len(self.split_unit.issue_fifo) > 0:
+            # Each FIFO element is already a complete package containing its
+            # mask, input row, input column, and mode.  Core broadcasts this
+            # one package to the PUs for the current cycle.
+            self.current_packet = self.split_unit.issue_fifo.popleft()
             self.issued_packets += 1
             return True
 
         if self.split_unit.is_finished:
+            # No packet remains in the FIFO and SplitUnit is done producing
+            # input.  The Core can finish only after all pending psum rows
+            # have been handed to the accumulator.
             self.pool.retire_old([])
             if not self.pool.has_pending():
                 self.is_finished = True
         else:
+            # SplitUnit still has input to produce, but no packet is
+            # available this cycle.  The compute stage is therefore stalled
+            # by an empty issue FIFO.
             self.frontend_stalls += 1
         return False
 
@@ -327,42 +344,19 @@ class Core:
     def _record_retire_backpressure_stall(self):
         self.retire_backpressure_stalls += 1
 
-    def _read_mode_mask(self, mode):
-        if mode == 0:
-            return self._read_bitstream(3)
-        if mode == 1:
-            value = self._read_bitstream(1)
-            return torch.tensor([value[0].item(), 0, 0], dtype=value.dtype)
-        if mode == 2:
-            return self._read_bitstream(3)
-        return torch.zeros(3, dtype=torch.int8)
+    @staticmethod
+    def _read_packet_mask(packet, mode):
+        """Return one package mask padded to the PE's three-bit interface."""
+        bitstream = packet.get('bitstream')
+        if bitstream is None:
+            return torch.zeros(3, dtype=torch.int8)
 
-    def _read_bitstream(self, width):
-        bitstream = self.current_row_insts['bitstream']
-        mask = torch.zeros(width, dtype=bitstream.dtype)
-        available = max(0, min(width, len(bitstream) - self.bitstream_ptr))
+        mask = torch.zeros(3, dtype=bitstream.dtype)
+        width = 1 if mode == 1 else 3
+        available = min(width, int(bitstream.numel()))
         if available > 0:
-            mask[:available] = bitstream[self.bitstream_ptr : self.bitstream_ptr + available]
+            mask[:available] = bitstream[:available]
         return mask
-
-    def _advance_conv_issue_ptr(self, mode):
-        if mode == 0:
-            if self._next_inst_is_mode0():
-                self.bitstream_ptr += 1
-            else:
-                self.bitstream_ptr += 3
-        elif mode == 1:
-            self.bitstream_ptr += 1
-        elif mode == 2:
-            self.bitstream_ptr += 3
-
-        self.inst_ptr += 1
-        self._drop_finished_insts()
-
-    def _advance_linear_issue_ptr(self):
-        self.inst_ptr += 1
-        self.bitstream_ptr += 3
-        self._drop_finished_insts()
 
     def _try_commit_linear_retire(self):
         pending = self.pending_linear_retire
@@ -376,17 +370,6 @@ class Core:
         if success:
             self.pending_linear_retire = None
         return success
-
-    def _next_inst_is_mode0(self):
-        next_ptr = self.inst_ptr + 1
-        return (
-            next_ptr < len(self.current_row_insts['mode'])
-            and int(self.current_row_insts['mode'][next_ptr]) == 0
-        )
-
-    def _drop_finished_insts(self):
-        if self.inst_ptr >= len(self.current_row_insts['r']):
-            self.current_row_insts = None
 
     def _decode_run_len(self, mode, mask):
         if mode == 2 and mask.numel() >= 3:

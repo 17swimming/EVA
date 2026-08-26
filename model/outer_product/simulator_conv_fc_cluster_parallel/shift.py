@@ -123,7 +123,7 @@ class SplitUnit:
         self.split = split(kernel_size=kernel_size, enabled_modes=self.enabled_modes)
         self.hazard_num = 0
 
-        self.row_fifo = deque()
+        self.issue_fifo = deque()     # issue FIFO，store packets
         self.fifo_depth = max(1, int(fifo_depth))
         self.sram_vec_capacity = sram_vec_capacity
         self.fetch_rows = fetch_rows
@@ -151,9 +151,8 @@ class SplitUnit:
         self.if_map = if_map
         self.mode = mode
         self.current_r = 0
-        self.pending_packet = None
         self.ready_packets = deque()
-        self.row_fifo.clear()
+        self.issue_fifo.clear()
         self.if_reg.clear()
         self.decode_slots.clear()
         self.completed_rows.clear()
@@ -171,7 +170,7 @@ class SplitUnit:
         self.row_last_idx = -1
         self.row_last_mode0 = -1
         self.row_last_mode = -1
-        self.mode0_known_bits = []
+        self.mode0_known_bits = []  # 当前行每个脉冲的状态，当且仅当某个 c 的 3 个输入脉冲都确定时，才把该列作为一个 mode0 packet 发射到 ready_packets
         self.mode0_pending_cols = deque()
 
         self.linear_entries = []
@@ -307,24 +306,20 @@ class SplitUnit:
         if self.is_finished:
             return
 
-        if self.pending_packet is not None:
-            if len(self.row_fifo) < self.fifo_depth:
-                self.row_fifo.append(self.pending_packet)
-                self.pending_packet = None
-            else:
-                self.hazard_num += 1
 
-        # One issue-FIFO write path. Produced packets become visible next tick.
-        if self.pending_packet is None and len(self.row_fifo) < self.fifo_depth:
+        # SplitUnit writes at most one complete package to the issue FIFO per
+        # cycle. The simulator calls this method after Core, so a package
+        # written here becomes visible to Core in the next cycle.
+        if len(self.issue_fifo) < self.fifo_depth:
             if self.ready_packets:
-                self.pending_packet = self.ready_packets.popleft()
+                self.issue_fifo.append(self.ready_packets.popleft())
             elif self.mode == 'conv':
                 self._tick_conv_encoder()
                 if self.ready_packets:
-                    self.pending_packet = self.ready_packets.popleft()
+                    self.issue_fifo.append(self.ready_packets.popleft())
             elif self.mode == 'linear':
                 if self.linear_entry_ptr < len(self.linear_entries):
-                    self.pending_packet = self.linear_entries[self.linear_entry_ptr]
+                    self.issue_fifo.append(self.linear_entries[self.linear_entry_ptr])
                     self.linear_entry_ptr += 1
                     self.current_r = min(self.if_map.shape[0], self.linear_entry_ptr)
                 else:
@@ -382,11 +377,12 @@ class SplitUnit:
             process_len = min(run_len, 7)
             # Statistics only; no mode2 packet is appended to ready_packets.
             self.conv_mode_counts[2] += 1
+            # 根据full1中shift_without_order.py可知，需要先从last_idx开始,填充mode0，再处理mode2。
             for idx in range(self.row_last_idx + 1, curr_idx):
                 self.mode0_known_bits[idx] = 0
             for idx in range(curr_idx, curr_idx + process_len):
                 self.mode0_known_bits[idx] = 0
-            self._emit_ready_mode0_cols()
+            self._emit_ready_mode0_cols()   # 由于第一个for循环补充了0，因此mode0的package已经补全了。
             self.row_work[curr_idx : curr_idx + process_len] = 0
             self.row_last_idx = curr_idx
             self.row_last_mode = 2
@@ -432,6 +428,7 @@ class SplitUnit:
     def _emit_ready_mode0_cols(self):
         while self.mode0_pending_cols:
             c = self.mode0_pending_cols[0]
+            # 只有当 c 的 3 个输入脉冲都确定时，才把该列作为一个 mode0 packet 发射到 ready_packets
             if any(self.mode0_known_bits[c + offset] is None for offset in range(self.k)):
                 return
             self.mode0_pending_cols.popleft()
@@ -442,13 +439,13 @@ class SplitUnit:
     def _packet(r, c, mode, bits):
         return {
             'bitstream': torch.tensor(bits, dtype=torch.int8),
-            'r': torch.tensor([int(r)], dtype=torch.int16),
-            'c': torch.tensor([int(c)], dtype=torch.int16),
+            'r': torch.tensor([int(r)], dtype=torch.int8    ),
+            'c': torch.tensor([int(c)], dtype=torch.int8),
             'mode': torch.tensor([int(mode)], dtype=torch.int8),
         }
 
     def _update_processing_debug_state(self):
-        queued = len(self.ready_packets) + int(self.pending_packet is not None)
+        queued = len(self.ready_packets)
         if self.mode == 'conv':
             row_nz = int(torch.count_nonzero(self.row_work).item()) if self.row_work is not None else 0
             later_rows = sum(1 for idx in range(self.next_row_idx, len(self.row_nonzero_flags)) if self.row_nonzero_flags[idx])
@@ -473,6 +470,5 @@ class SplitUnit:
         self.is_finished = (
             input_done
             and not self.ready_packets
-            and self.pending_packet is None
-            and len(self.row_fifo) == 0
+            and len(self.issue_fifo) == 0
         )
