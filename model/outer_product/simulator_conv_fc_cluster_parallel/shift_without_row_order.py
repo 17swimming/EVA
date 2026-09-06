@@ -15,7 +15,7 @@ def _make_packet(r, c, mode, bits):
 
 
 class split:
-    """Encode one assigned input row into mode0 packages in real time."""
+    """Reference row encoder used by tests and compatibility paths."""
 
     def __init__(self, kernel_size=3, enabled_modes=(0, 1, 2)):
         self.k = kernel_size
@@ -23,15 +23,97 @@ class split:
         if 0 not in self.enabled_modes or not self.enabled_modes.issubset({0, 1, 2}):
             raise ValueError("enabled_modes must contain mode 0 and only use modes 0, 1, and 2")
 
-    def init_stream(self, if_map, fifo, fifo_depth):
+    def process(self, if_line, r: int):
+        if not isinstance(if_line, torch.Tensor):
+            if_line = torch.tensor(if_line, dtype=torch.int8)
+
+        work_line = if_line.view(-1).clone()
+        width = len(work_line)
+        max_c = width - self.k
+        bitstream = []
+        c_array = []
+        mode_array = []
+
+        last_idx = -1
+        last_mode0 = -1
+        last_mode = -1
+        while True:
+            nz_mask = work_line != 0
+            if not nz_mask.any():
+                break
+
+            curr_idx = nz_mask.nonzero(as_tuple=True)[0][0].item()
+            zero_count = curr_idx - last_idx - 1
+
+            run_len = 0
+            while curr_idx + run_len < width and work_line[curr_idx + run_len] == 1:
+                run_len += 1
+
+            if 2 in self.enabled_modes and run_len >= 4:
+                if last_mode == 0:
+                    bitstream.extend([0] * (curr_idx - last_idx - 1))
+                process_len = min(run_len, 7)
+                c_array.append(curr_idx)
+                mode_array.append(2)
+                bitstream.extend([(process_len >> 2) & 1, (process_len >> 1) & 1, process_len & 1])
+                work_line[curr_idx : curr_idx + process_len] = 0
+                last_idx = curr_idx
+                last_mode = 2
+                continue
+
+            is_mode1 = (
+                zero_count >= 2
+                and curr_idx < width - 2
+                and work_line[curr_idx + 1] == 0
+                and work_line[curr_idx + 2] == 0
+            )
+            if 1 in self.enabled_modes and is_mode1:
+                if last_mode == 0:
+                    bitstream.extend([0, 0])
+                c_array.append(curr_idx)
+                mode_array.append(1)
+                bitstream.append(work_line[curr_idx].item())
+                last_mode = 1
+            else:
+                bitstream.extend([0, 0] if zero_count >= 2 else [0] * zero_count)
+                bitstream.append(work_line[curr_idx].item())
+
+                distance = curr_idx - last_mode0
+                end_k = min(curr_idx, max_c)
+                start_k = curr_idx - self.k + 1 if distance >= self.k else curr_idx - distance + 1
+                for c in range(start_k, end_k + 1):
+                    if 0 <= c <= max_c:
+                        c_array.append(c)
+                        mode_array.append(0)
+                last_mode0 = curr_idx
+                last_mode = 0
+
+            work_line[curr_idx] = 0
+            last_idx = curr_idx
+
+        if last_mode == 0:
+            tail_zeros = width - 1 - last_idx
+            if tail_zeros > 0:
+                bitstream.extend([0, 0] if tail_zeros >= 2 else [0] * tail_zeros)
+
+        return (
+            torch.tensor(bitstream, dtype=torch.int8),
+            torch.tensor([r] * len(c_array), dtype=torch.int16),
+            torch.tensor(c_array, dtype=torch.int16),
+            torch.tensor(mode_array, dtype=torch.int8),
+        )
+
+    def init_stream(self, if_map, first_row, row_step, fifo, fifo_depth):
         """Initialize one real-time Split without scanning the feature map."""
         self.if_map = if_map
-        self.assigned_row = None
+        self.next_row = int(first_row)
+        self.row_step = int(row_step)
         self.fifo = fifo
         self.fifo_depth = max(1, int(fifo_depth))
         self.row_work = None
         self.row_r = None
-        self.row_done = True
+        self.current_row_data = None
+        self.row_done = False
         self.finished = False
         self.row_last_idx = -1
         self.row_last_mode0 = -1
@@ -40,11 +122,20 @@ class split:
         self.mode0_pending_cols = deque()
         self.conv_mode_counts = collections.Counter({0: 0, 1: 0, 2: 0})
 
-    def _start_assigned_row(self):
-        """Load the row selected by SplitUnit's global row dispatcher."""
-        self.row_r = self.assigned_row
-        self.assigned_row = None
+    def _start_next_row(self):
+        """Load one assigned row; its contents are scanned later by tick."""
+        if self.next_row >= self.if_map.shape[0]:
+            self.row_work = None
+            self.row_r = None
+            self.current_row_data = None
+            self.row_done = True
+            self.finished = True
+            return
+
+        self.row_r = self.next_row
+        self.next_row += self.row_step
         self.row_work = self.if_map[self.row_r].view(-1).clone()
+        self.current_row_data = self.if_map[self.row_r]
         self.row_done = False
         self.row_last_idx = -1
         self.row_last_mode0 = -1
@@ -69,6 +160,7 @@ class split:
         if self.mode0_pending_cols:
             return
         self.row_work = None
+        self.current_row_data = None
         self.row_done = True
 
     def tick_stream(self, allow_next_row=False):
@@ -76,12 +168,19 @@ class split:
         if self.finished:
             return
 
-        # 只有 SplitUnit 派发了新行，并且上一行 FIFO 已排空，才能开始下一行。
-        if self.row_done:
-            if allow_next_row and not self.fifo and not self.mode0_pending_cols:
-                self._start_assigned_row()
+        # A completed row can be replaced immediately.  Both Split objects
+        # share one FIFO, so packages from different rows may be interleaved.
+        if self.row_work is None and not self.row_done:
+            # The first tick loads the first assigned row. Loading is kept
+            # separate from scanning so init_stream never walks the ifmap.
+            self._start_next_row()
+        elif self.row_done:
+            if allow_next_row and not self.mode0_pending_cols:
+                self._start_next_row()
             else:
                 return
+        if self.finished:
+            return
 
         # First drain packages delayed by FIFO back pressure. Only then can
         # the scanner inspect another nonzero pulse from this row.
@@ -160,12 +259,22 @@ class split:
         self.row_work[curr_idx] = 0
         self.row_last_idx = curr_idx
 
+    def remaining_work(self):
+        """Return a lightweight debug estimate of work left in this Split."""
+        if self.finished:
+            return len(self.fifo)
+        pending = len(self.mode0_pending_cols)
+        current = int(torch.count_nonzero(self.row_work).item()) if self.row_work is not None else 0
+        rows_left = max(0, (self.if_map.shape[0] - self.next_row + self.row_step - 1) // self.row_step)
+        return len(self.fifo) + pending + current + rows_left + int(self.row_work is None)
+
+
 class SplitUnit:
     """Cycle-level streaming split front-end for the cluster simulator.
 
-    Conv mode dynamically assigns the next unclaimed row to whichever Split
-    becomes idle first. Each Split owns one bounded FIFO, while expected_row
-    still enforces strictly increasing row order at Core issue time.
+    Conv mode uses num_split real-time Split objects. Split i handles rows
+    i, i + num_split, i + 2 * num_split, ... and all objects share one FIFO.
+    Linear mode keeps the previous single-stream behavior.
     """
 
     def __init__(
@@ -185,44 +294,42 @@ class SplitUnit:
         self.enabled_modes = frozenset(int(mode) for mode in enabled_modes)
         if 0 not in self.enabled_modes or not self.enabled_modes.issubset({0, 1, 2}):
             raise ValueError("enabled_modes must contain mode 0 and only use modes 0, 1, and 2")
-        # Keep state inside the two named Split objects.  This is deliberately
-        # written as split0/split1 rather than a generic lane abstraction so
-        # the row ownership is explicit in the simulator trace.
-        self.split0 = split(kernel_size=kernel_size, enabled_modes=self.enabled_modes)
-        self.split1 = split(kernel_size=kernel_size, enabled_modes=self.enabled_modes)
-        # Existing simulator setup code updates split.enabled_modes directly;
-        # retain this alias for compatibility with that code.
+        self.num_split = max(1, int(num_split))
         self.splits = [
             split(kernel_size=kernel_size, enabled_modes=self.enabled_modes)
-            for _ in range(num_split)
+            for _ in range(self.num_split)
         ]
-        self.num_split = num_split
+        # Keep the old names as compatibility aliases for the first two
+        # Split objects.
+        self.split0 = self.splits[0]
+        self.split1 = self.splits[1] if self.num_split > 1 else self.splits[0]
+        self.split = self.split0
+        self.hazard_num = 0
 
         self.fifo_depth = max(1, int(fifo_depth))
-        self.issue_fifo0 = deque()    # split0 的 FIFO，存放完整 package
-        self.issue_fifo1 = deque()    # split1 的 FIFO，存放完整 package
-        # The next row allowed to reach Core. row_owner records which FIFO
-        # must be selected because dynamic assignment is not tied to parity.
-        self.expected_row = 0
-        self.next_unassigned_row = 0
-        self.row_owner = {}
-        self.skipped_zero_rows = set()
-        self.completed_rows = set()
+        # split0 and split1 write to the same bounded FIFO.  The aliases keep
+        # older diagnostics that inspect issue_fifo0/issue_fifo1 working.
+        self.issue_fifo = deque()
+        self.issue_fifo0 = self.issue_fifo
+        self.issue_fifo1 = self.issue_fifo
+        self.sram_vec_capacity = sram_vec_capacity
+        self.fetch_rows = fetch_rows
+        self.decode_lanes = max(1, int(fetch_rows if decode_lanes is None else decode_lanes))
+        self.rob_depth = max(
+            1,
+            int((fetch_rows + self.decode_lanes + self.fifo_depth) if rob_depth is None else rob_depth),
+        )
+
+        self.if_reg = deque(maxlen=fetch_rows)
+        self.decode_slots = []
+        self.completed_rows = {}
+        self.processing_cycles_left = 0
+        self.current_row_data = None
         self.is_finished = True
         # SplitUnit-owned mode histogram for conv. This is intentionally not
         # gathered at PE issue time, because cluster_parallel drops detected
         # mode1/mode2 packets before they reach the FIFO.
         self.conv_mode_counts = collections.Counter({0: 0, 1: 0, 2: 0})
-
-    @property
-    def issue_fifo(self):
-        """Return the FIFO for the input row currently being issued.
-
-        Core still reads one complete package through this existing interface;
-        selecting the deque here avoids introducing a third FIFO.
-        """
-        owner = self.row_owner.get(self.expected_row, 0)
-        return self.issue_fifo0 if owner == 0 else self.issue_fifo1
 
     def init_stream(self, if_map, mode='conv'):
         if not isinstance(if_map, torch.Tensor):
@@ -230,32 +337,38 @@ class SplitUnit:
 
         self.if_map = if_map
         self.mode = mode
-        self.issue_fifo0.clear()
-        self.issue_fifo1.clear()
-        self.expected_row = 0
-        self.next_unassigned_row = 0
-        self.row_owner.clear()
-        self.skipped_zero_rows.clear()
+        self.current_r = 0
+        self.issue_fifo.clear()
+        self.if_reg.clear()
+        self.decode_slots.clear()
         self.completed_rows.clear()
+        self.current_row_data = None
+        self.processing_cycles_left = 0
         # Reset per feature map. The simulator later scales this representative
         # histogram by Cout groups when printing mode ratios.
         self.conv_mode_counts = collections.Counter({0: 0, 1: 0, 2: 0})
 
+        self.row_nonzero_bitmask = 0
+        self.row_nonzero_flags = []
+        self.next_row_idx = 0
+
         self.linear_entries = []
         self.linear_entry_ptr = 0
         if mode == 'conv':
-            # 初始化只建立两套 Split 状态，不预先分配输入行。真正的行队列
-            # 调度从第一次 tick 开始，与 simulator 中 Cin 的派发时机一致。
-            self.split0.enabled_modes = frozenset(self.enabled_modes)
-            self.split1.enabled_modes = frozenset(self.enabled_modes)
-            self.split0.init_stream(if_map, fifo=self.issue_fifo0, fifo_depth=self.fifo_depth)
-            self.split1.init_stream(if_map, fifo=self.issue_fifo1, fifo_depth=self.fifo_depth)
+            # Initialization only installs the feature-map reference. Every
+            # Split starts scanning its assigned rows in tick().
+            for split_idx, current_split in enumerate(self.splits):
+                current_split.enabled_modes = frozenset(self.enabled_modes)
+                current_split.init_stream(
+                    if_map,
+                    first_row=split_idx,
+                    row_step=self.num_split,
+                    fifo=self.issue_fifo,
+                    fifo_depth=self.fifo_depth,
+                )
         elif mode == 'linear':
-            # 对于线性层，ifmap只要一整行非全零，就生成一个 packet
-            # 现在的实现是在initial时就全生成，不过即使tick时才生成，也能保证每拍都有package
-            # 毕竟快速找到非零行，还是容易的。
-            self.split0.finished = True
-            self.split1.finished = True
+            for current_split in self.splits:
+                current_split.finished = True
             base_r = 2
             for tb in range(if_map.shape[0]):
                 tb_vec = if_map[tb].view(-1)
@@ -277,76 +390,54 @@ class SplitUnit:
             return
 
         if self.mode == 'conv':
-            # Core has consumed the current package before this method. Save
-            # drained row completions before assigning new work to that Split.
-            self._record_completed_rows()
-            self._advance_expected_row()
-
-            start0 = self._assign_next_row_if_idle(self.split0, 0)
-            start1 = self._assign_next_row_if_idle(self.split1, 1)
-            self.split0.tick_stream(allow_next_row=start0)
-            self.split1.tick_stream(allow_next_row=start1)
-
-            self._record_completed_rows()
-            self._advance_expected_row()
+            # Both Split objects scan every cycle and may load their next row
+            # independently.  A full shared FIFO applies back pressure to
+            # whichever Split is trying to emit at that moment.
+            for current_split in self.splits:
+                current_split.tick_stream(allow_next_row=True)
             self._sync_mode_counts()
         elif self.mode == 'linear':
             if len(self.issue_fifo) < self.fifo_depth:
                 if self.linear_entry_ptr < len(self.linear_entries):
                     self.issue_fifo.append(self.linear_entries[self.linear_entry_ptr])
                     self.linear_entry_ptr += 1
+                    self.current_r = min(self.if_map.shape[0], self.linear_entry_ptr)
+                else:
+                    self.current_r = self.if_map.shape[0]
+
+        self.current_row_data = next(
+            (
+                current_split.current_row_data
+                for current_split in self.splits
+                if current_split.current_row_data is not None
+            ),
+            None,
+        )
+        self._update_processing_debug_state()
         self._update_finished_state()
 
-    def _record_completed_rows(self):
-        """Keep completion state after an idle Split starts another row."""
-        for current in (self.split0, self.split1):
-            if current.row_r is None:
-                continue
-            if current.row_done and not current.fifo and not current.mode0_pending_cols:
-                self.completed_rows.add(current.row_r)
-
-    def _assign_next_row_if_idle(self, current, split_id):
-        """从全局行队列向空闲 Split 派发下一条非零行。"""
-        if (
-            current.finished
-            or not current.row_done
-            or current.fifo
-            or current.mode0_pending_cols
-        ):
-            return False
-
-        # 与 Cin 队列派发相同：始终检查队首。全零行没有计算任务，直接
-        # 标记完成并继续检查下一行，不占用 split0/split1 的处理周期。
-        while self.next_unassigned_row < self.if_map.shape[0]:
-            row = self.next_unassigned_row
-            self.next_unassigned_row += 1
-            if not torch.any(self.if_map[row] != 0):
-                self.completed_rows.add(row)
-                self.skipped_zero_rows.add(row)
-                continue
-
-            self.row_owner[row] = split_id
-            # tick_stream() 在本拍装载并扫描该行。
-            current.assigned_row = row
-            return True
-
-        current.finished = True
-        return False
-
-    def _advance_expected_row(self):
-        """Advance only across completed, fully drained rows."""
-        while self.expected_row in self.completed_rows:
-            self.expected_row += 1
-
     def _sync_mode_counts(self):
-        """Aggregate mode counters maintained independently by split0/split1."""
+        """Aggregate mode counters maintained independently by each Split."""
         self.conv_mode_counts = collections.Counter({0: 0, 1: 0, 2: 0})
-        self.conv_mode_counts.update(self.split0.conv_mode_counts)
-        self.conv_mode_counts.update(self.split1.conv_mode_counts)
+        for current_split in self.splits:
+            self.conv_mode_counts.update(current_split.conv_mode_counts)
+
+    def _update_processing_debug_state(self):
+        if self.mode == 'conv':
+            self.processing_cycles_left = (
+                sum(current_split.remaining_work() for current_split in self.splits)
+                + len(self.issue_fifo)
+            )
+        elif self.mode == 'linear':
+            self.processing_cycles_left = len(self.issue_fifo) + max(
+                0, len(self.linear_entries) - self.linear_entry_ptr
+            )
+        else:
+            self.processing_cycles_left = len(self.issue_fifo)
 
     def _update_finished_state(self):
         if self.mode == 'conv':
-            input_done = self.split0.finished and self.split1.finished
+            input_done = all(current_split.finished for current_split in self.splits)
         elif self.mode == 'linear':
             input_done = self.linear_entry_ptr >= len(self.linear_entries)
         else:
@@ -354,6 +445,5 @@ class SplitUnit:
 
         self.is_finished = (
             input_done
-            and not self.issue_fifo0
-            and not self.issue_fifo1
+            and not self.issue_fifo
         )

@@ -1,9 +1,18 @@
+# FC 模式，core映射为不同的k，pe映射为不同的cout
+
 import torch
 from model.outer_product.simulator_conv_fc_cluster_parallel.Accumulator import Accumulator
 from model.outer_product.simulator_conv_fc_cluster_parallel.core import Core
 from model.utils import ceil_a_by_b, Stats
 import collections
 
+CORE_CYCLE_LABELS = {
+    'compute': '正常计算',
+    'frontend': 'SplitUnit 供数不足',
+    'psum_alloc': 'Psum 分配停顿',
+    'writeback': 'Psum 写回排空',
+    'idle': '空闲/调度',
+}
 
 
 class OutProductSimulator:
@@ -21,6 +30,7 @@ class OutProductSimulator:
         enable_reduce_tree=True,
         psum_pool_rows=6,
         enabled_modes=(0, 1, 2),
+        num_split=2,
     ):
         self.num_cores = num_cores
         self.num_core_per_cluster = num_cores
@@ -46,6 +56,7 @@ class OutProductSimulator:
         self.enable_reduce_tree = bool(enable_reduce_tree)
         self.psum_pool_rows = int(psum_pool_rows)
         self.enabled_modes = tuple(sorted(int(mode) for mode in enabled_modes))
+        self.num_split = max(1, int(num_split))
 
         self.clusters = [
             [
@@ -59,6 +70,7 @@ class OutProductSimulator:
                     retire_column=self.retire_column,
                     psum_pool_rows=self.psum_pool_rows,
                     enabled_modes=self.enabled_modes,
+                    num_split=self.num_split,
                 )
                 for _ in range(num_cores)
             ]
@@ -85,7 +97,8 @@ class OutProductSimulator:
             for core in cluster:
                 core.enabled_modes = modes
                 core.split_unit.enabled_modes = frozenset(modes)
-                core.split_unit.split.enabled_modes = frozenset(modes)
+                for current_split in core.split_unit.splits:
+                    current_split.enabled_modes = frozenset(modes)
 
     def _reset_performance_counters(self):
         self.pe_cycles.zero_()
@@ -98,6 +111,12 @@ class OutProductSimulator:
         self.writeback_drain_reason_cycles = collections.Counter()
         self.writeback_drain_occupancy_totals = collections.Counter()
         self.retire_trace_cycle = 0
+        self.tile_assignment_counts = [0] * self.num_cores
+        self.all_zero_channel_counts = 0
+        self.conv_core_cycle_counts = {
+            core: collections.Counter({state: 0 for state in CORE_CYCLE_LABELS})
+            for cluster in self.clusters for core in cluster
+        }
         for cluster in self.clusters:
             for core in cluster:
                 core.reset_performance_counters()
@@ -142,6 +161,7 @@ class OutProductSimulator:
         self,
         accumulators,
         representative_compute_cycles,
+        conv_cout_scale=None,
     ):
         if not isinstance(accumulators, (list, tuple)):
             accumulators = [accumulators]
@@ -155,7 +175,9 @@ class OutProductSimulator:
         self.global_stats.num_clusters = self.num_clusters
         self.global_stats.num_simulated_clusters = self.num_simulated_clusters
         self.global_stats.frontend_stall_cycles = sum(
-            core.frontend_stalls for cluster in self.clusters for core in cluster
+            core.frontend_stalls 
+            for cluster in self.clusters 
+            for core in cluster
         )
         self.global_stats.compute_issue_core_cycles = sum(
             getattr(core, 'compute_issue_cycles', 0)
@@ -189,6 +211,34 @@ class OutProductSimulator:
         self.global_stats.pe_cycles = self.pe_cycles.clone()
         self.global_stats.cluster_pe_cycles = self.cluster_pe_cycles.clone()
         self.global_stats.issued_packets = self.issued_packets
+        if conv_cout_scale is not None:
+            # 原始计数覆盖代表性 Cout-group；各项与 compute_cycles 使用相同
+            # 倍率，不能将未放大的 Core 停顿除以已经放大的层周期。
+            per_core = []
+            representative = collections.Counter()
+            for core, counts in self.conv_core_cycle_counts.items():
+                assert sum(counts.values()) == representative_compute_cycles
+                assert counts['frontend'] == core.frontend_stalls
+                assert counts['psum_alloc'] == core.psum_buffer_alloc_stalls
+                assert counts['compute'] == core.compute_issue_cycles
+                representative.update(counts)
+                per_core.append({key: value * conv_cout_scale for key, value in counts.items()})
+            scaled = {key: value * conv_cout_scale for key, value in representative.items()}
+            denominator = self.compute_cycles * len(per_core)
+            assert sum(scaled.values()) == denominator
+            self.global_stats.conv_core_cycles = scaled
+            self.global_stats.conv_core_cycles_per_core = per_core
+            self.global_stats.conv_core_cycles_representative = dict(representative)
+            self.global_stats.conv_core_cycle_denominator = denominator
+            self.global_stats.conv_core_cycle_scale = conv_cout_scale
+            self.global_stats.conv_core_cycle_ratios = {
+                key: value / denominator if denominator else 0.0
+                for key, value in scaled.items()
+            }
+            print('\n[Conv 路径 Core 平均周期占比]')
+            print(f'  分母: {self.compute_cycles} cycles x {len(per_core)} cores = {denominator} core-cycles')
+            for key, label in CORE_CYCLE_LABELS.items():
+                print(f'  {label}: {scaled[key]} core-cycles ({self.global_stats.conv_core_cycle_ratios[key]:.2%})')
         representative_mode_counts = collections.Counter()
         for cluster in self.clusters:
             for core in cluster:
@@ -581,15 +631,18 @@ class OutProductSimulator:
                                     for i, core in enumerate(self.cores):
                                         if core.is_finished and cin_queue:
                                             local_cin = cin_queue[0]
-                                            # [c,h,w]
+                                            # 输入已按 group 切片；全局 Cin 编号需换算成组内索引。
+                                            # 权重仍使用下方传递的全局 local_cin，不改变数据位宽。
                                             current_cin_map = current_input_tile[local_cin - cin_start, :, :]
                                             
                                             # 全0通道直接快速跳过
                                             if torch.sum(current_cin_map) == 0:
                                                 cin_queue.pop(0)
+                                                self.all_zero_channel_counts += 1
                                                 continue 
                                                 
                                             cin_queue.pop(0)
+                                            self.tile_assignment_counts[i] += 1
                                             for cluster_idx, cluster in enumerate(self.clusters):
                                                 cluster_kernel = wave_kernels[cluster_idx]
                                                 cluster_core = cluster[i]
@@ -606,6 +659,22 @@ class OutProductSimulator:
                                                     if_map=current_cin_map,
                                                     H=current_cin_map.shape[0],
                                                 )
+
+                                    # 每拍每个 Core 都采样，包括已完成、等待其他 Core 的空闲拍。
+                                    # 在写回前记录排空状态，避免漏计最后一次写回/释放的周期。
+                                    cycle_before = {
+                                        core: (
+                                            core.compute_issue_cycles,
+                                            core.frontend_stalls,
+                                            core.psum_buffer_alloc_stalls,
+                                            not core.is_finished
+                                            and core.split_unit.is_finished
+                                            and not core.has_pending_issue()
+                                            and core.pool is not None
+                                            and core.pool.has_pending(),
+                                        )
+                                        for core in self.conv_core_cycle_counts
+                                    }
 
                                     # (A) accumulator consumes requests from
                                     # the previous cycle first.
@@ -628,6 +697,28 @@ class OutProductSimulator:
 
                                             if not core.is_finished:
                                                 core.tick_compute()
+
+                                    # 各 Core 独立互斥分类，不要求其他 Core 同时停顿。
+                                    # 成功计算与前端/分配失败由本拍计数增量判断；完成计算后
+                                    # 首次 retire_old([]) 新产生的排空状态也计入写回等待。
+                                    for core, (compute, frontend, psum_alloc, was_draining) in cycle_before.items():
+                                        if core.compute_issue_cycles > compute:
+                                            state = 'compute'
+                                        elif core.frontend_stalls > frontend:
+                                            state = 'frontend'
+                                        elif core.psum_buffer_alloc_stalls > psum_alloc:
+                                            state = 'psum_alloc'
+                                        elif was_draining or (
+                                            not core.is_finished
+                                            and core.split_unit.is_finished
+                                            and not core.has_pending_issue()
+                                            and core.pool is not None
+                                            and core.pool.has_pending()
+                                        ):
+                                            state = 'writeback'
+                                        else:
+                                            state = 'idle'
+                                        self.conv_core_cycle_counts[core][state] += 1
 
                                     # (D) SplitUnit produces the next package
                                     # after Core; it is visible next cycle.
@@ -683,6 +774,7 @@ class OutProductSimulator:
             self._publish_performance_counters(
                 accumulators,
                 representative_compute_cycles,
+                conv_cout_scale=Cout_group_nums_per_g,
             )
             self._print_performance_counters()
 
@@ -707,21 +799,24 @@ class OutProductSimulator:
             # else:
             #     print("  ✅ 存储流水线畅通：未发生任何 Bank 写入冲突和反压阻塞。")
                 
-            print("\n[各 Core 微架构停顿画像]")
+            print("\n[一个cout_group中，各 Core 微架构停顿画像]")
             total_frontend_stalls = 0
             total_psum_alloc_stalls = 0
             total_retire_backpressure_stalls = 0
+            print(f" 全零通道数目: {self.all_zero_channel_counts} 个")
             for i, core in enumerate(self.cores):
                 core_stalls = getattr(core, 'psum_buffer_alloc_stalls', getattr(core, 'stalls', 0))
                 retire_stalls = getattr(core, 'retire_backpressure_stalls', 0)
                 frontend_stalls = getattr(core, 'frontend_stalls', 0)
+                assigned_tiles = self.tile_assignment_counts[i]
                 total_psum_alloc_stalls += core_stalls
                 total_retire_backpressure_stalls += retire_stalls
                 total_frontend_stalls += frontend_stalls
                 print(
-                    f"  -> Core {i}: [后端] Psum分配失败停顿: {core_stalls:4d} 拍 | "
-                    f"[后端] Retire写回反压: {retire_stalls:4d} 拍 | "
-                    f"[前端] Split 供数不足空转: {frontend_stalls:4d} 拍"
+                    f"  -> Core {i}:Psum分配失败停顿: {core_stalls:4d} 拍 | "
+                    f"Retire写回反压: {retire_stalls:4d} 拍 | "
+                    f"Split 供数不足空转: {frontend_stalls:4d} 拍 | "
+                    f"分配tile: {assigned_tiles:4d}块"
                 )
 
             print(f"\n[前端解析性能 (Frontend Bubble) 评估]")
@@ -866,6 +961,8 @@ class OutProductSimulator:
                         if torch.sum(core_input) == 0:
                             continue
 
+                        self.tile_assignment_counts[i] += 1
+
                         # 3*48 of core weight
                         for cluster_idx, cluster in enumerate(self.clusters):
                             cluster_weight = wave_weights[cluster_idx]
@@ -983,13 +1080,15 @@ class OutProductSimulator:
             core_stalls = getattr(core, 'psum_buffer_alloc_stalls', getattr(core, 'stalls', 0))
             retire_stalls = getattr(core, 'retire_backpressure_stalls', 0)
             frontend_stalls = getattr(core, 'frontend_stalls', 0)
+            assigned_tiles = self.tile_assignment_counts[i]
             total_psum_alloc_stalls += core_stalls
             total_retire_backpressure_stalls += retire_stalls
             total_frontend_stalls += frontend_stalls
             print(
                 f"  -> Core {i}: [后端] Psum分配失败累积停顿: {core_stalls:4d} 拍 | "
                 f"[后端] Retire写回反压累积: {retire_stalls:4d} 拍 | "
-                f"[前端] Split 供数累积空转: {frontend_stalls:4d} 拍"
+                f"[前端] Split 供数累积空转: {frontend_stalls:4d} 拍 | "
+                f"分配 tile 数: {assigned_tiles:4d}"
             )
         print(f"  代表 cluster 累计 PsumPool 无可用 buffer 计算停顿: **{total_psum_alloc_stalls}** 拍")
         print(f"  代表 cluster 累计 retire 写回反压后台挂起事件: **{total_retire_backpressure_stalls}** 拍")

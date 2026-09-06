@@ -1,10 +1,10 @@
 # simulator_conv_fc_cluster
 
-本目录是在 `simulator_conv_fc_tile_PsumPool_4bank_pro` 的 mode0/1/2 功能基础上，加入 cluster 架构和 stream retire 的 cycle model。代码风格尽量保持 plus 版本的直观写法：模块少、路径清楚、注释使用英文，避免 pro 版本那种过度拆函数带来的阅读压力。
+代码风格尽量保持 plus 版本的直观写法：模块少、路径清楚、注释简洁且使用英文，避免过度拆函数带来的阅读压力。
 
 ## 设计目标
 
-1. 和 pro 版本一样，split/core/PE 路径同时支持 `mode0`、`mode1`、`mode2`。
+1. 同时支持 `mode0`、`mode1`、`mode2`。
 2. 实现 stream retire：根据 PE0/PE1/PE2 的计算顺序，某个 psum pool 行在被 PE2 最后一次使用后，可以把安全前缀列 retire 到后级 accumulator。
 3. `retire_column` 当前默认 `3`，可配置。conv 中表示每拍每个 psum pool 的一行最多 retire 3 列；FC 中表示每拍把同一个 column 的 3 行打包 retire。
 4. 所有 psum pool 都可以在同一拍提出 retire 请求，行为一致；cluster accumulator 被建模为 `bank_h * bank_w` 点级寄存器阵列，同一拍可访问任意 `(row, col)`。

@@ -21,12 +21,23 @@ class Accumulator:
         bank_h=None,
         bank_w=None,
         enable_reduce_tree=True,
+        num_pus=1,
+        mp_size=16,
+        drain_words_per_cycle=4,
     ):
         self.num_sub_banks = None if num_sub_banks is None else int(num_sub_banks)
         self.bank_h = None if bank_h is None else int(bank_h)
         self.bank_w = None if bank_w is None else int(bank_w)
         self.retire_column = int(retire_column)
         self.enable_reduce_tree = bool(enable_reduce_tree)
+        self.num_pus = int(num_pus)
+        self.mp_size = int(mp_size)
+        self.drain_words_per_cycle = int(drain_words_per_cycle)
+        if min(self.num_pus, self.mp_size, self.drain_words_per_cycle) <= 0:
+            raise ValueError("Accumulator widths and drain throughput must be positive")
+        self.word_width_bits = self.num_pus * self.mp_size
+        self.lif_units = self.drain_words_per_cycle * self.num_pus
+        self.drain_words_remaining = 0
 
         self.accessed_rows = set()
         self.write_lookup = {}
@@ -38,6 +49,10 @@ class Accumulator:
         self.bundles = []
 
         self.stats = {
+            "drain_requests": 0,
+            "drain_cycles": 0,
+            "drained_words": 0,
+            "drained_bits": 0,
             "processed_writes": 0,
             "processed_bundles": 0,
             "stalled_requests": 0,
@@ -58,6 +73,8 @@ class Accumulator:
                 self.stats[f"{category}_conflict_overlap_{overlap}_requests"] = 0
 
     def request_bundle(self, core_id, rows, cols, data, kind="unknown"):
+        if not self.is_empty():
+            return False
         expanded = self._prepare_expanded(rows, cols, data)
         if not expanded:
             return True
@@ -76,6 +93,8 @@ class Accumulator:
 
     def request_bundle_partial(self, core_id, rows, cols, data, kind="fc"):
         expanded = self._prepare_expanded(rows, cols, data)
+        if not self.is_empty():
+            return [False] * len(expanded)
         if not expanded:
             return []
         self._record_request_overlap(kind, self._row_overlap(expanded))
@@ -110,9 +129,31 @@ class Accumulator:
         self.accessed_rows.clear()
         self.write_lookup.clear()
         self._conflicted_cores_this_cycle.clear()
+        if self.drain_words_remaining:
+            words = min(self.drain_words_per_cycle, self.drain_words_remaining)
+            self.drain_words_remaining -= words
+            self.stats["drain_cycles"] += 1
+            self.stats["drained_words"] += words
+            self.stats["drained_bits"] += words * self.word_width_bits
+
+    def request_drain(self):
+        """Signal completed accumulation; the next tick drains up to four words.
+
+        A word is one (row, col) point containing num_pus membrane potentials.
+        Scan the full physical array, including zero and unused entries.
+        The caller must first finish all K tasks and retire their Psum pools.
+        """
+        if not self.is_empty():
+            raise RuntimeError("Accumulator drain is already in progress")
+        if self.bank_h is None or self.bank_w is None or min(self.bank_h, self.bank_w) <= 0:
+            raise ValueError("Accumulator drain requires positive bank_h and bank_w")
+        self.drain_words_remaining = self.bank_h * self.bank_w
+        self.stats["drain_requests"] += 1
 
     def is_empty(self):
-        return True
+        # No pending output operation. Accepted Psum contributions themselves
+        # do not start a drain; only the scheduler's completion signal does.
+        return self.drain_words_remaining == 0
 
     def _prepare_expanded(self, rows, cols, data):
         rows = [int(row) for row in rows]

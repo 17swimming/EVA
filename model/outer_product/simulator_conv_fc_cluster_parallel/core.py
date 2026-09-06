@@ -20,6 +20,7 @@ class Core:
         retire_column=3,
         psum_pool_rows=6,
         enabled_modes=(0, 1, 2),
+        num_split=2,
     ):
         self.kernel_size = kernel_size
         self.num_pus = num_pus
@@ -36,6 +37,7 @@ class Core:
             fifo_depth=split_fifo_depth,
             fetch_rows=fetch_rows,
             enabled_modes=self.enabled_modes,
+            num_split=num_split,
         )
 
         self.pus = [
@@ -49,35 +51,22 @@ class Core:
         # currently being processed so it can be retried after a stall.
         self.current_packet = None
         self.is_finished = True
-        self.total_tail_draining_cycles = 0
-        self.reset_performance_counters()
-
-    def reset_performance_counters(self):
         self.psum_buffer_alloc_stalls = 0
-        self.retire_backpressure_stalls = 0
-        self.stalls = 0
         self.frontend_stalls = 0
         self.pe_cycles = torch.zeros(3, dtype=torch.int64)
-        self.issued_packets = 0
+        self.compute_issue_cycles = 0
         # Accumulates SplitUnit-owned mode statistics across all cin feature
         # maps assigned to this core in the current representative run.
         self.conv_mode_split_counts = collections.Counter({0: 0, 1: 0, 2: 0})
-        self.retire_trace_cycle = 0
-        self.psum_alloc_stall_reasons = collections.Counter()
-        self.psum_alloc_stall_occupancy_totals = collections.Counter()
-        self.psum_alloc_stall_active_rows_hist = collections.Counter()
-        self.retire_column_cycle_stats = collections.defaultdict(
-            lambda: {
-                'span_cols': 0,
-                'marked_cols': 0,
-                'events': 0,
-            }
-        )
-        self.retire_column_total_stats = {
-            'span_cols': 0,
-            'marked_cols': 0,
-            'events': 0,
-        }
+        self.conv_mode_counts_pending = False
+
+    def reset_performance_counters(self):
+        self.frontend_stalls = 0
+        self.psum_buffer_alloc_stalls = 0
+        self.pe_cycles = torch.zeros(3, dtype=torch.int64)
+        self.compute_issue_cycles = 0
+        self.conv_mode_split_counts = collections.Counter({0: 0, 1: 0, 2: 0})
+        self.conv_mode_counts_pending = False
 
     def has_pending_issue(self):
         return (
@@ -134,9 +123,8 @@ class Core:
         self.is_finished = False
 
         self.split_unit.init_stream(if_map)
-        self.conv_mode_split_counts.update(self.split_unit.conv_mode_counts)
-        for mode in (0, 1, 2):
-            self.conv_mode_split_counts.setdefault(mode, 0)
+        # 实时 Split 在后续 tick 中检测模式，必须等当前 Cin tile 完成后再汇总。
+        self.conv_mode_counts_pending = True
         self.current_packet = None
         self.pending_linear_retire = None
 
@@ -160,7 +148,7 @@ class Core:
         for tr in active_rs:
             buf = self.pool.get_or_allocate(tr)
             if buf is None:
-                self._record_psum_alloc_stall(active_rs)
+                self._record_psum_alloc_stall()
                 return
             buffers_to_use[tr] = buf
 
@@ -178,9 +166,12 @@ class Core:
             if r - 2 in buffers_to_use:
                 pu['W2'].process_v2(mask, c, r - 2, buffers_to_use[r - 2]['data'], mode)
                 self._mark_modified_columns(buffers_to_use[r - 2], c, mode, mask)
-                self._record_pe2_retire_columns(buffers_to_use[r - 2], c, mode, mask)
+                self._request_pe2_stream_retire(buffers_to_use[r - 2], c, mode, mask)
                 self.pe_cycles[2] += 1
 
+        # 按 Core 计数：多个 PE 同拍执行只算一次，Psum 分配失败不计入。
+        if buffers_to_use:
+            self.compute_issue_cycles += 1
         self.current_packet = None
 
     def init_for_linear_tile(self, accumulator, core_id, if_map, valid_pu):
@@ -201,6 +192,7 @@ class Core:
         self.split_unit.init_stream(if_map, mode='linear')
         self.current_packet = None
         self.pending_linear_retire = None
+        self.conv_mode_counts_pending = False
 
         self.H = 999999
 
@@ -211,8 +203,6 @@ class Core:
         if self.pending_linear_retire is not None:
             if self._try_commit_linear_retire():
                 self.current_packet = None
-            else:
-                self._record_retire_backpressure_stall()
             return
 
         if not self._ensure_current_packet():
@@ -224,6 +214,7 @@ class Core:
         mode = int(packet['mode'].item())
         mask = self._read_packet_mask(packet, mode)
 
+        # 不同pe对应不同cout，每个cout对应一行psum————这里我把psum看成3x12
         target_r0 = r
         target_r1 = r - 1
         target_r2 = r - 2
@@ -235,7 +226,7 @@ class Core:
         for tr in active_rs:
             buf = self.pool.get_or_allocate(tr)
             if buf is None:
-                self._record_psum_alloc_stall(active_rs)
+                self._record_psum_alloc_stall()
                 return
             buffers_to_use[tr] = buf
 
@@ -248,6 +239,7 @@ class Core:
             self._mark_modified_columns(buffers_to_use[target_r1], c, mode, mask)
             self._mark_modified_columns(buffers_to_use[target_r2], c, mode, mask)
             self.pe_cycles += 1
+            self.compute_issue_cycles += 1
             self.pending_linear_retire = {
                 'col': c,
                 'row_buffers': [
@@ -257,7 +249,6 @@ class Core:
                 ],
             }
             if not self._try_commit_linear_retire():
-                self._record_retire_backpressure_stall()
                 return
 
         self.current_packet = None
@@ -280,7 +271,6 @@ class Core:
             # mask, input row, input column, and mode.  Core broadcasts this
             # one package to the PUs for the current cycle.
             self.current_packet = self.split_unit.issue_fifo.popleft()
-            self.issued_packets += 1
             return True
 
         if self.split_unit.is_finished:
@@ -289,6 +279,9 @@ class Core:
             # have been handed to the accumulator.
             self.pool.retire_old([])
             if not self.pool.has_pending():
+                if self.conv_mode_counts_pending:
+                    self.conv_mode_split_counts.update(self.split_unit.conv_mode_counts)
+                    self.conv_mode_counts_pending = False
                 self.is_finished = True
         else:
             # SplitUnit still has input to produce, but no packet is
@@ -310,39 +303,8 @@ class Core:
 
         return active_rs
 
-    def _record_psum_alloc_stall(self, active_rs=None):
+    def _record_psum_alloc_stall(self):
         self.psum_buffer_alloc_stalls += 1
-        self.stalls += 1
-        if active_rs is not None:
-            self.psum_alloc_stall_active_rows_hist[len(active_rs)] += 1
-        if self.pool is None:
-            self.psum_alloc_stall_reasons["no_pool"] += 1
-            return
-
-        summary = self.pool.occupancy_summary()
-        for key, value in summary.items():
-            self.psum_alloc_stall_occupancy_totals[key] += int(value)
-
-        if (
-            summary.get("pending_fc_bundles", 0)
-            or summary.get("active_fc_pending", 0)
-            or summary.get("pending_wb_fc_pending", 0)
-        ):
-            reason = "fc_pending_retire"
-        elif summary.get("pending_wb", 0):
-            reason = "row_pending_wb"
-        elif summary.get("active_stream_pending", 0):
-            reason = "stream_pending_retire"
-        elif summary.get("modified_buffers", 0):
-            reason = "modified_active_buffers"
-        elif summary.get("active", 0):
-            reason = "all_buffers_active"
-        else:
-            reason = "unknown"
-        self.psum_alloc_stall_reasons[reason] += 1
-
-    def _record_retire_backpressure_stall(self):
-        self.retire_backpressure_stalls += 1
 
     @staticmethod
     def _read_packet_mask(packet, mode):
@@ -423,25 +385,11 @@ class Core:
 
         return max(0, min(self.psum_w, int(end)))
 
-    def _record_pe2_retire_columns(self, buf, c, mode, mask):
+    def _request_pe2_stream_retire(self, buf, c, mode, mask):
         end_idx = self._retire_end_exclusive(c, mode, mask)
         if end_idx is None:
             return
-
-        start_idx = max(0, min(self.psum_w, int(buf.get('retire_limit', 0))))
-        if end_idx <= start_idx:
+        if end_idx <= int(buf.get('retire_limit', 0)):
             return
-
-        span_cols = end_idx - start_idx
-        marked_cols = int(buf['modified'][start_idx:end_idx].sum().item())
-        cycle = int(getattr(self, 'retire_trace_cycle', 0))
-        stats = self.retire_column_cycle_stats[cycle]
-        stats['span_cols'] += span_cols
-        stats['marked_cols'] += marked_cols
-        stats['events'] += 1
-
-        self.retire_column_total_stats['span_cols'] += span_cols
-        self.retire_column_total_stats['marked_cols'] += marked_cols
-        self.retire_column_total_stats['events'] += 1
 
         self.pool.request_stream_retire(buf, end_idx)
