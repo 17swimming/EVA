@@ -40,7 +40,7 @@ class split:
                 run_len += 1
 
             if 2 in self.enabled_modes and run_len >= 4:
-                if last_mode == 0:
+                if last_mode == 0:  # 需要先补全mode0的package的bitstream
                     bitstream.extend([0] * (curr_idx - last_idx - 1))
                 process_len = min(run_len, 7)
                 c_array.append(curr_idx)

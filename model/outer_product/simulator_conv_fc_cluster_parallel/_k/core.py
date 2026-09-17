@@ -55,6 +55,14 @@ class Core:
         self.frontend_stalls = 0
         self.pe_cycles = torch.zeros(3, dtype=torch.int64)
         self.compute_issue_cycles = 0
+        # Express issue is an independent ready/valid channel. Until an
+        # Express Unit is connected, ready stays high so mode1/2 packages are
+        # accepted without consuming the normal mode0 issue slot.
+        self.express_ready = True
+        self.express_valid = False
+        self.express_packet = None
+        self.express_fire = False
+        self.express_issue_cycles = 0
         # Accumulates SplitUnit-owned mode statistics across all cin feature
         # maps assigned to this core in the current representative run.
         self.conv_mode_split_counts = collections.Counter({0: 0, 1: 0, 2: 0})
@@ -65,6 +73,10 @@ class Core:
         self.psum_buffer_alloc_stalls = 0
         self.pe_cycles = torch.zeros(3, dtype=torch.int64)
         self.compute_issue_cycles = 0
+        self.express_valid = False
+        self.express_packet = None
+        self.express_fire = False
+        self.express_issue_cycles = 0
         self.conv_mode_split_counts = collections.Counter({0: 0, 1: 0, 2: 0})
         self.conv_mode_counts_pending = False
 
@@ -127,10 +139,17 @@ class Core:
         self.conv_mode_counts_pending = True
         self.current_packet = None
         self.pending_linear_retire = None
+        self.express_valid = False
+        self.express_packet = None
+        self.express_fire = False
 
     def tick_compute(self):
         if self.is_finished:
             return
+
+        # Normal and Express issue are independent. Both may fire in this
+        # cycle from the same four-entry Split issue window.
+        self._issue_express_packet()
 
         if not self._ensure_current_packet():
             return
@@ -193,6 +212,9 @@ class Core:
         self.current_packet = None
         self.pending_linear_retire = None
         self.conv_mode_counts_pending = False
+        self.express_valid = False
+        self.express_packet = None
+        self.express_fire = False
 
         self.H = 999999
 
@@ -254,23 +276,23 @@ class Core:
         self.current_packet = None
 
     def _ensure_current_packet(self):
-        """Keep a stalled package or fetch one complete package from FIFO.
+        """Keep a stalled package or select the oldest mode0 package.
 
-        The first branch and the FIFO branch are mutually exclusive.  A
+        The first branch and the issue-window branch are mutually exclusive. A
         package that has already been fetched remains in ``current_packet``
         while the backend waits for a psum buffer or retire capacity.  Only
-        after that package completes do we fetch the next FIFO element.
+        after that package completes do we select another mode0 package.
         """
         if self.current_packet is not None:
             # Retry the same package after a resource stall.  It must not be
             # removed from the FIFO again or decoded as a second package.
             return True
 
-        if len(self.split_unit.issue_fifo) > 0:
-            # Each FIFO element is already a complete package containing its
-            # mask, input row, input column, and mode.  Core broadcasts this
-            # one package to the PUs for the current cycle.
-            self.current_packet = self.split_unit.issue_fifo.popleft()
+        packet = self.split_unit.pop_mode0_packet()
+        if packet is not None:
+            # Mode1/2 packages remain available to the independent Express
+            # issue channel and never occupy the normal PE issue slot.
+            self.current_packet = packet
             return True
 
         if self.split_unit.is_finished:
@@ -289,6 +311,19 @@ class Core:
             # by an empty issue FIFO.
             self.frontend_stalls += 1
         return False
+
+    def _issue_express_packet(self):
+        """Drive one mode1/2 package on the independent Express interface."""
+        self.express_packet = self.split_unit.peek_express_packet()
+        self.express_valid = self.express_packet is not None
+        self.express_fire = self.express_valid and bool(self.express_ready)
+        if not self.express_fire:
+            return
+
+        # Remove the exact oldest Express candidate observed above. No Psum
+        # work is modeled here; the future Express Unit owns that behavior.
+        self.express_packet = self.split_unit.pop_express_packet()
+        self.express_issue_cycles += 1
 
     def _active_rows_for_conv(self, r):
         active_rs = []

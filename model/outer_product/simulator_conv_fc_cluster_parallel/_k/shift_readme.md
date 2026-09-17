@@ -5,8 +5,6 @@
 frontend_stalls，这个计数正好表示 Core 想取包但 issue_fifo 为空的周期数，每个tile都会有一拍固定的frontend_stalls，因此我们的目标是让frontend_stalls = 分配的tile数——————我已经取消了这一拍的固定开销。
 
 
-## issue fifo
-self.issue_fifo， 存放package，深度为2就足够，深度继续增加不会有性能提升。
 
 ## shift_initial_hole_ifmap.py的实现方式
 ready_packets -> issue_fifo -> Core
@@ -21,13 +19,20 @@ ready_packets在初始化时写入所有package。
 
 
 ## shift.py的实现方式
-使用两个split，每个split处理一行,并且每个split都有一个深度为4个package的FIFO，但是严格按照输入行号从这两个split中取package，并把这个过程称为预计算。
-对于split来说，如果在预计算时发现了pattern1/2，也正常存入FIFO。
+使用两个split，每个split处理一行,并且每个split都有一个深度为4个package的 issue queue，但是严格按照输入行号从这两个split中取package，并把这个过程称为预计算。
+对于split来说，如果在预计算时发现了pattern1/2，也正常存入issue queue。
 注意：pattern1和pattern2的package一拍就能得到，
 
+## issue queue
+存放package，深度为4，可同时选择最老的 mode0 和最老的 mode1/2，给issue。
 
+在硬件实现时，
 
 ## issue
-core中的issue逻辑，在发包时，如果是pattern 0，发给PE array（即所有的PU），如果是pattern1/2，就把package发给express unit。
+core中的issue逻辑，在发包时，如果是pattern 0，发给PE array（即所有的PU），如果是pattern1/2，就把package发给express unit。————express unit等笑源实现，先留好package的接口。
 
+使用两个issue逻辑分别给PE array和express unit发包，
+从issue  window中取package，
+
+# 测试
 通过test_sim.py验证可知，每个tile都会有一拍固定的frontend_stalls。

@@ -15,7 +15,7 @@ def _make_packet(r, c, mode, bits):
 
 
 class split:
-    """Encode one assigned input row into mode0 packages in real time."""
+    """Encode one assigned input row into enabled-mode packages in real time."""
 
     def __init__(self, kernel_size=3, enabled_modes=(0, 1, 2)):
         self.k = kernel_size
@@ -57,7 +57,9 @@ class split:
         while self.mode0_pending_cols and len(self.fifo) < self.fifo_depth:
             c = self.mode0_pending_cols[0]
             # A mode0 window is usable only after all k input positions are
-            # known. Dropped mode1/mode2 positions are represented as zero.
+            # known. Positions handled by mode1/mode2 are represented as zero
+            # in overlapping mode0 windows; their work is carried by their own
+            # packages in this same FIFO.
             if any(self.mode0_known_bits[c + offset] is None for offset in range(self.k)):
                 return
             self.mode0_pending_cols.popleft()
@@ -112,8 +114,6 @@ class split:
 
         if 2 in self.enabled_modes and run_len >= 4:
             process_len = min(run_len, 7)
-            # Mode2 is counted but never inserted into an issue FIFO.
-            self.conv_mode_counts[2] += 1
             # The gap is filled first, then the mode2 run is masked. This is
             # required before testing newly completed mode0 windows.
             for idx in range(self.row_last_idx + 1, curr_idx):
@@ -121,6 +121,21 @@ class split:
             for idx in range(curr_idx, curr_idx + process_len):
                 self.mode0_known_bits[idx] = 0
             self._emit_ready_mode0_cols()
+
+            # Mode0/1/2 share this Split's only FIFO. Delayed mode0 packages
+            # keep priority; if they fill the FIFO, leave this run untouched
+            # in row_work and retry after Core drains one package.
+            if len(self.fifo) >= self.fifo_depth:
+                return
+            self.fifo.append(
+                _make_packet(
+                    self.row_r,
+                    curr_idx,
+                    2,
+                    [(process_len >> 2) & 1, (process_len >> 1) & 1, process_len & 1],
+                )
+            )
+            self.conv_mode_counts[2] += 1
             self.row_work[curr_idx : curr_idx + process_len] = 0
             self.row_last_idx = curr_idx
             self.row_last_mode = 2
@@ -133,12 +148,24 @@ class split:
             and self.row_work[curr_idx + 2] == 0
         )
         if 1 in self.enabled_modes and is_mode1:
-            # Mode1 is counted but never inserted into an issue FIFO.
-            self.conv_mode_counts[1] += 1
             for idx in range(self.row_last_idx + 1, curr_idx):
                 self.mode0_known_bits[idx] = 0
             self.mode0_known_bits[curr_idx] = 0
             self._emit_ready_mode0_cols()
+
+            # Use the same FIFO as mode0 and mode2. Do not consume the pulse
+            # until the package has actually entered the bounded FIFO.
+            if len(self.fifo) >= self.fifo_depth:
+                return
+            self.fifo.append(
+                _make_packet(
+                    self.row_r,
+                    curr_idx,
+                    1,
+                    [int(self.row_work[curr_idx].item())],
+                )
+            )
+            self.conv_mode_counts[1] += 1
             self.row_last_mode = 1
         else:
             for idx in range(self.row_last_idx + 1, curr_idx):
@@ -209,20 +236,61 @@ class SplitUnit:
         self.skipped_zero_rows = set()
         self.completed_rows = set()
         self.is_finished = True
-        # SplitUnit-owned mode histogram for conv. This is intentionally not
-        # gathered at PE issue time, because cluster_parallel drops detected
-        # mode1/mode2 packets before they reach the FIFO.
+        # SplitUnit owns the histogram because modes are classified when their
+        # packages enter the per-Split FIFO, before Core issues them.
         self.conv_mode_counts = collections.Counter({0: 0, 1: 0, 2: 0})
 
     @property
     def issue_fifo(self):
-        """Return the FIFO for the input row currently being issued.
+        """Return the issue window for the input row currently being issued.
 
-        Core still reads one complete package through this existing interface;
-        selecting the deque here avoids introducing a third FIFO.
+        Each Split still owns only one depth-limited deque. Core may select the
+        oldest mode0 entry and the oldest mode1/2 entry independently, so this
+        deque also acts as the small issue window for the current row.
         """
         owner = self.row_owner.get(self.expected_row, 0)
         return self.issue_fifo0 if owner == 0 else self.issue_fifo1
+
+    @staticmethod
+    def _packet_mode(packet):
+        return int(packet['mode'].item())
+
+    def _find_issue_index(self, accepted_modes):
+        """Find the oldest matching package in the current Split's window."""
+        accepted_modes = frozenset(accepted_modes)
+        for index, packet in enumerate(self.issue_fifo):
+            if self._packet_mode(packet) in accepted_modes:
+                return index
+        return None
+
+    def _peek_issue_packet(self, accepted_modes):
+        index = self._find_issue_index(accepted_modes)
+        return None if index is None else self.issue_fifo[index]
+
+    def _pop_issue_packet(self, accepted_modes):
+        index = self._find_issue_index(accepted_modes)
+        if index is None:
+            return None
+
+        # deque has no pop(index). Rotation removes the selected entry while
+        # retaining the relative age order of every package left in the window.
+        window = self.issue_fifo
+        window.rotate(-index)
+        packet = window.popleft()
+        window.rotate(index)
+        return packet
+
+    def peek_mode0_packet(self):
+        return self._peek_issue_packet((0,))
+
+    def pop_mode0_packet(self):
+        return self._pop_issue_packet((0,))
+
+    def peek_express_packet(self):
+        return self._peek_issue_packet((1, 2))
+
+    def pop_express_packet(self):
+        return self._pop_issue_packet((1, 2))
 
     def init_stream(self, if_map, mode='conv'):
         if not isinstance(if_map, torch.Tensor):

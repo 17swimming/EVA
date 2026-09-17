@@ -390,18 +390,21 @@ class OutProductSimulator:
                                         for core in self.conv_core_cycle_counts
                                     }
 
-                                    # (C) SplitUnit produces the next package
-                                    # after Core; it is visible next cycle.
+                                    # (B) Core consumes packages already in the
+                                    # issue window at the start of this cycle.
+                                    # Normal and Express issue may free two
+                                    # entries before Split checks backpressure.
+                                    # for core in self.cores:
+                                    #     if not core.is_finished:
+
+                                    # (C) Split uses the entries released above
+                                    # to generate packages at this cycle edge.
+                                    # Core has already run, so newly generated
+                                    # packages cannot be issued until next cycle.
                                     for core in self.cores:
                                         if not core.is_finished:
                                             core.split_unit.tick()
-
-                                    # (B) Core consumes packages already in the
-                                    # FIFO at the start of this cycle.
-                                    for core in self.cores:
-                                        if not core.is_finished:
                                             core.tick_compute()
-
                                     # (A) Psum 写回请求。
                                     # 请求由下一拍入口的 accumulator.tick() 统一仲裁。
                                     for core in self.cores:
