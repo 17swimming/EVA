@@ -10,26 +10,52 @@
 
 ## 运行五个完整工作负载
 
-```powershell
-python -B -u -X utf8 model/test_outerproduct_simulator/run_1104_eva_end_to_end.py --output-root output/20261104/EVA_only --skip-tim-reference
-```
+统一入口是 `model/test_outerproduct_simulator/simulator_runner.py`，通过 `--accumulator-variant 1104` 直接调用 `zxy/20261104/model/simulator.py`。五个网络都使用完整清单，不传 `--max-test-cases`。
 
-此入口调用 `simulator_runner.py`，先运行 TIM，然后并行运行其余四个完整清单，不使用前十层截断。固定配置为 4 Core、16 PU、12×12 tile、64 LIF、accumulator bundle buffer 深度 2、仲裁候选 2、一个 scheduler 派发通道、8 个 psum pool bank、四个 splitunit FIFO 各深度 4、模式 0/1/2。延迟换算主频为 500 MHz，`latency_ms = cycles / 500000`。各网络时间步参数为 TIM 10、QKFormer 16、SpikeBRGNet 5、EMSYOLO 5、SDTrack 4；保留激励实际时间步及运行器原有算子支持范围。
+固定配置为 4 Core、16 PU、12×12 tile、64 LIF、accumulator bundle buffer 深度 2、仲裁候选 2、一个 scheduler 派发通道、8 个 psum pool bank、四个 splitunit FIFO 各深度 4、模式 0/1/2。延迟换算主频为 500 MHz，`latency_ms = cycles / 500000`。各网络时间步参数为 TIM 10、QKFormer 16、SpikeBRGNet 5、EMSYOLO 5、SDTrack 4；保留激励实际时间步及运行器原有算子支持范围。
 
-`--skip-tim-reference` 是为独立仓库增加的选项，仅跳过依赖原机器历史结果的比较，不改变周期模型和实验配置。没有此选项时，原脚本仍要求 `output/performance_analysis/nine_way_layers_core4_dispatch1_lif64_bundle2_20261106/`；`--resume-after-tim` 仅用于原批次已记录差异的续跑。历史参考不随本次上传。
-
-正式长时间实验应以独立后台进程运行。Windows 示例（使用全新结果目录）：
+下面的 PowerShell 命令直接为每个网络启动独立的 `simulator_runner.py` 后台进程，无需额外 Python 编排脚本。结果目录必须为全新目录，已有本轮结果时请更换 `$evaOutput`：
 
 ```powershell
 $evaPython = (Get-Command python).Source
 $evaRoot = (Get-Location).Path
-New-Item -ItemType Directory -Path output/20261104/EVA_only -Force | Out-Null
-$evaProcess = Start-Process -FilePath $evaPython -WorkingDirectory $evaRoot -ArgumentList @('-B','-u','-X','utf8','model/test_outerproduct_simulator/run_1104_eva_end_to_end.py','--output-root','output/20261104/EVA_only','--skip-tim-reference') -WindowStyle Hidden -RedirectStandardOutput output/20261104/EVA_only/batch.stdout.log -RedirectStandardError output/20261104/EVA_only/batch.stderr.log -PassThru
-Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -eq $evaProcess.Id -or $_.ParentProcessId -eq $evaProcess.Id } | Select-Object ProcessId,ParentProcessId,Name
-Get-Content output/20261104/EVA_only/batch.stderr.log
+$evaOutput = 'output/20261104/EVA_only'
+if (Test-Path -LiteralPath $evaOutput) { throw 'Use a new result directory' }
+New-Item -ItemType Directory -Path $evaOutput -Force | Out-Null
+$env:EVA_DISPATCH_LANES = '1'
+$env:OMP_NUM_THREADS = '1'
+$env:MKL_NUM_THREADS = '1'
+$env:OPENBLAS_NUM_THREADS = '1'
+$evaCommon = @(
+    '-B','-u','-X','utf8','model/test_outerproduct_simulator/simulator_runner.py',
+    '--simulator','cluster_parallel','--accumulator-variant','1104','--eva-only',
+    '--num_cores','4','--num_pus','16','--bank_h','12','--bank_w','12',
+    '--num_split','2','--num_clusters','1','--fetch_rows','8',
+    '--split_fifo_depth','4','--psum_pool_rows','8','--retire_column','3',
+    '--retire-packets-per-cycle','2','--prefetch-cycles','2',
+    '--bundle-buffer-depth','2','--bank-lookahead-entries','2','--lif-units','64',
+    '--num_reduce_trees','0','--enabled_modes','0,1,2','--B','1',
+    '--output-root',$evaOutput
+)
+$evaNetworks = [ordered]@{
+    TIM_NCARS = 10
+    QKFormer_DVSGesture = 16
+    SpikeBRGNet_DDD17 = 5
+    SDTrack_FE108 = 4
+    EMSYOLO_GEN1 = 5
+}
+$evaProcesses = foreach ($entry in $evaNetworks.GetEnumerator()) {
+    $evaArguments = $evaCommon + @('--network',$entry.Key,'--T',[string]$entry.Value)
+    Start-Process -FilePath $evaPython -WorkingDirectory $evaRoot -ArgumentList $evaArguments -WindowStyle Hidden -RedirectStandardOutput "$evaOutput/$($entry.Key).stdout.log" -RedirectStandardError "$evaOutput/$($entry.Key).stderr.log" -PassThru
+}
+Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -in $evaProcesses.Id } | Select-Object ProcessId,ParentProcessId,Name,CommandLine
+Get-Content "$evaOutput/*.stderr.log"
+Get-Content "$evaOutput/*.stdout.log" -Tail 8
 ```
 
-启动后检查父进程、模拟子进程以及各网络 console 日志。`progress.json` 记录进度，`summary.json` 记录逐网络周期及有效层数，网络子目录包含逐层 CSV 和 `calls.jsonl`。`COMPLETE.json` 表示流程结束；成功还必须满足 `status=pass`、`finished_workloads=5`、`passed_workloads=5`、`failures=[]`。完成后 `eva_cycle_updates.json` 给出工作簿所需周期，脚本不会自动改写工作簿。
+如只运行一个网络，保留公共参数和环境变量，只对相应网络执行一次 `Start-Process`。需要先核对 TIM 时，先仅启动 TIM，核对后再启动其余四个网络。
+
+每个网络结果位于 `<output-root>/<network>_1104/`，包含 `manifest.json`、`calls.jsonl`、`performance_summary.json`、逐层结果 CSV 和模拟日志。日志中的测试用例编号表示当前进度。完成需同时核对进程退出码为零、日志出现“仿真任务完成”、网络 `COMPLETE.json` 的 `status=pass`，以及调用数和逐层结果。五个网络需要分别核对。直接运行不会生成批次级 `progress.json`、`summary.json` 或批次级 `COMPLETE.json`，也不会自动更新工作簿。端到端周期取各网络完成日志中的“总EVA周期”，TIM 不能直接以逐调用周期之和替代。
 
 ## 已完成实验的端到端周期
 
@@ -51,4 +77,4 @@ TIM 保留网络末尾的 −417 池化修正。历史参考为 474113；最新�
 python output/lookahead/plot_all_figures.py --only end_to_end --workbook output/20261106/end_to_end.xlsx
 ```
 
-其他绘图任务需要各自实验数据，详见 `output/lookahead/README.md`。本次上传不修改 baseline 周期或绘图样式。`run_1104_workload_batch.py` 提供共用运行和校验函数，其独立运行默认参数不同；复现本次配置请使用上述 `run_1104_eva_end_to_end.py`。
+其他绘图任务需要各自实验数据，详见 `output/lookahead/README.md`。本次上传不修改 baseline 周期或绘图样式。

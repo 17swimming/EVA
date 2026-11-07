@@ -36,7 +36,7 @@ CONV供数不足表示存在尚未完成的splitunit任务、取不到mode0 pack
 
 日志保留与lookahead提取入口兼容的互斥计数和总周期分解。`calls.jsonl`新增`paper_cycle_breakdown`，`performance_summary.json`新增各通路的`other_breakdown`、`cycles_breakdown`和`cycles_breakdown_ratios`；结束后生成`cycles_breakdown_calls.csv`。五网络批次入口另外生成逐层六类表格和批次汇总，不覆盖既有论文图片。
 
-可复用批次入口为`model/test_outerproduct_simulator/run_1104_workload_batch.py --output-root <独立结果目录>`。默认并行运行五个网络，4 core、EVA_only、8个psum pool bank、bundle buffer深度3、候选3、四个package FIFO各深度4。时间步参数与现有激励一致：TIM 10、QKFormer 16、SpikeBRGNet 5、EMSYOLO 5、SDTrack 4；不截断原始激励。批次`COMPLETE.json`区分结束与通过，要求finished_workloads=5、passed_workloads=5、failures为空；单网络完成标志不代表整个批次结束。
+五个网络均直接通过`model/test_outerproduct_simulator/simulator_runner.py`调用模拟器，完整命令见仓库根目录`README.md`。时间步参数与现有激励一致：TIM 10、QKFormer 16、SpikeBRGNet 5、EMSYOLO 5、SDTrack 4；不截断原始激励。每个网络分别保存`COMPLETE.json`，须结合进程退出码、完成日志、调用数和逐层结果核对；单网络完成标志不代表五个网络全部结束。
 
 保留现有重叠模型及 `Stats.compute_cycles`、`Stats.total_cycles` 的数值。
 `compute_cycles` 是计算与泄漏积分发放计算重叠后的后端墙钟周期，包含调度、退休、写回与反压等待。
