@@ -1,0 +1,14 @@
+{
+  "draw_tile_size_dse.py": "model/outer_product/tile_size_dse/draw_tile_size_dse.py",
+  "collect_tile_dse_results.py": "model/outer_product/tile_size_dse/collect_tile_dse_results.py",
+  "draw_core_count_dse.py": "model/outer_product/dse_core_number/draw_core_count_dse.py",
+  "collect_core_count_dse_results.py": "model/outer_product/dse_core_number/collect_core_count_dse_results.py",
+  "plot_ablation_cycles_patterns.py": "model/outer_product/ablation_study/plot_ablation_cycles_patterns.py",
+  "plot_workbook_end_to_end.py": "model/outer_product/end_to_end_eval/plot_workbook_end_to_end.py",
+  "plot_cluster_normalized_speedup.py": "model/outer_product/end_to_end_eval/plot_cluster_normalized_speedup.py",
+  "draw_pu_number.py": "output/dse_SIMD_Width/draw_pu_number.py",
+  "scale_pu_number.py": "output/dse_SIMD_Width/scale_pu_number.py",
+  "draw_dse_combined.py": "output/lookahead/draw_dse_combined.py",
+  "extract_cycles_breakdown.py": "output/lookahead/cycles_breakdown/extract_cycles_breakdown.py",
+  "draw_area_power_breakdown.py": "model/outer_product/simulator_conv_fc_cluster/area_power_breakdown/draw_area_power_breakdown.py"
+}

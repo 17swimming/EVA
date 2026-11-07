@@ -1,0 +1,27 @@
+type,spike,Cout/dim,file,sparsity,flops,shape
+"conv2d_(3, 3)_(1, 1)_(1, 1)",32,16,"./other/QKFormer_DVSGesTure/conv2d_(3, 3)_(1, 1)_(1, 1)_patch_embed1_proj_conv_Cout_16_nonbinary.npy",0.9226,75497472,"[16, 2, 128, 128]"
+"conv2d_(3, 3)_(1, 1)_(1, 1)",TRUE,32,"./conv/QKFormer_DVSGesTure/conv2d_(3, 3)_(1, 1)_(1, 1)_patch_embed1_proj1_conv_Cout_32.npy",0.9957,1207959552,"[16, 1, 16, 128, 128]"
+"conv2d_(3, 3)_(1, 1)_(1, 1)",TRUE,64,"./conv/QKFormer_DVSGesTure/conv2d_(3, 3)_(1, 1)_(1, 1)_patch_embed1_proj2_conv_Cout_64.npy",0.9615,1207959552,"[16, 1, 32, 64, 64]"
+"conv2d_(3, 3)_(1, 1)_(1, 1)",TRUE,128,"./conv/QKFormer_DVSGesTure/conv2d_(3, 3)_(1, 1)_(1, 1)_patch_embed1_proj3_conv_Cout_128.npy",0.9379,1207959552,"[16, 1, 64, 32, 32]"
+"conv2d_(1, 1)_(4, 4)_(0, 0)",TRUE,128,"./conv/QKFormer_DVSGesTure/conv2d_(1, 1)_(4, 4)_(0, 0)_patch_embed1_proj_res_conv_Cout_128.npy",0.9615,16777216,"[16, 1, 32, 64, 64]"
+conv1d_1_1,2,128,./other/QKFormer_DVSGesTure/conv1d_1_1_stage1_0_tssa_q_conv_dim_128_nonbinary.npy,0.8769,67108864,"[16, 128, 256]"
+Token_QK_Attention,TRUE,NONE,./atten/QKFormer_DVSGesTure/Token_QK_Attention_Q_stage1_0_tssa.npy,0.9564,268435456,"[16, 1, 16, 256, 8]"
+conv1d_1_1,2,128,./other/QKFormer_DVSGesTure/conv1d_1_1_stage1_0_tssa_k_conv_dim_128_nonbinary.npy,0.8769,67108864,"[16, 128, 256]"
+conv1d_1_1,TRUE,128,./conv/QKFormer_DVSGesTure/conv1d_1_1_stage1_0_tssa_proj_conv_dim_128.npy,0.9859,67108864,"[16, 128, 256]"
+"conv2d_(1, 1)_(1, 1)_(0, 0)",3,512,"./other/QKFormer_DVSGesTure/conv2d_(1, 1)_(1, 1)_(0, 0)_stage1_0_mlp_mlp1_conv_Cout_512_nonbinary.npy",0.841,268435456,"[16, 128, 16, 16]"
+"conv2d_(1, 1)_(1, 1)_(0, 0)",TRUE,128,"./conv/QKFormer_DVSGesTure/conv2d_(1, 1)_(1, 1)_(0, 0)_stage1_0_mlp_mlp2_conv_Cout_128.npy",0.971,268435456,"[16, 1, 512, 16, 16]"
+"conv2d_(3, 3)_(1, 1)_(1, 1)",4,256,"./other/QKFormer_DVSGesTure/conv2d_(3, 3)_(1, 1)_(1, 1)_patch_embed2_proj_conv_Cout_256_nonbinary.npy",0.794,1207959552,"[16, 128, 16, 16]"
+"conv2d_(3, 3)_(1, 1)_(1, 1)",TRUE,256,"./conv/QKFormer_DVSGesTure/conv2d_(3, 3)_(1, 1)_(1, 1)_patch_embed2_proj4_conv_Cout_256.npy",0.9711,2415919104,"[16, 1, 256, 16, 16]"
+"conv2d_(1, 1)_(2, 2)_(0, 0)",4,256,"./other/QKFormer_DVSGesTure/conv2d_(1, 1)_(2, 2)_(0, 0)_patch_embed2_proj_res_conv_Cout_256_nonbinary.npy",0.794,33554432,"[16, 128, 16, 16]"
+conv1d_1_1,2,256,./other/QKFormer_DVSGesTure/conv1d_1_1_stage2_0_ssa_q_conv_dim_256_nonbinary.npy,0.8455,67108864,"[16, 256, 64]"
+Spiking_Self_Attention,TRUE,NONE,./atten/QKFormer_DVSGesTure/Spiking_Self_Attention_Q_stage2_0_ssa.npy,0.8203,33554432,"[16, 1, 16, 64, 16]"
+conv1d_1_1,2,256,./other/QKFormer_DVSGesTure/conv1d_1_1_stage2_0_ssa_k_conv_dim_256_nonbinary.npy,0.8455,67108864,"[16, 256, 64]"
+conv1d_1_1,2,256,./other/QKFormer_DVSGesTure/conv1d_1_1_stage2_0_ssa_v_conv_dim_256_nonbinary.npy,0.8455,67108864,"[16, 256, 64]"
+conv1d_1_1,TRUE,256,./conv/QKFormer_DVSGesTure/conv1d_1_1_stage2_0_ssa_proj_conv_dim_256.npy,0.9334,67108864,"[16, 256, 64]"
+"conv2d_(1, 1)_(1, 1)_(0, 0)",3,1024,"./other/QKFormer_DVSGesTure/conv2d_(1, 1)_(1, 1)_(0, 0)_stage2_0_mlp_mlp1_conv_Cout_1024_nonbinary.npy",0.7728,268435456,"[16, 256, 8, 8]"
+"conv2d_(1, 1)_(1, 1)_(0, 0)",TRUE,256,"./conv/QKFormer_DVSGesTure/conv2d_(1, 1)_(1, 1)_(0, 0)_stage2_0_mlp_mlp2_conv_Cout_256.npy",0.9027,268435456,"[16, 1, 1024, 8, 8]"
+Linear,0.9658,11,./other/QKFormer_DVSGesTure/Linear_head_Nout_11_nonbinary.npy,0,N/A,"[1, 256]"
+,,,,,,
+,,,,flops_conv,7323254784,0.822808671
+,,,,flops_fc,1577058304,
+,,,,total_flops,8933867520,

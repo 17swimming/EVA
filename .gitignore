@@ -5,3 +5,14 @@ __pycache__/
 .agents/
 .EVA画图/
 .paper/
+
+# Input tensors are supplied separately.
+/conv/
+/atten/
+/other/
+*.npy
+*.npz
+*.pt
+*.pth
+*.log
+/output/20261104/EVA_only/
